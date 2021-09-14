@@ -19,4 +19,10 @@ RUN pip3 install --no-cache-dir -e .
 
 RUN mkdir logs && chown -R indy:indy logs && chmod -R ug+rw logs
 
-ENTRYPOINT ["/bin/bash", "-c", "aca-py \"$@\"", "--"]
+RUN apk add --no-cache \
+	nginx \
+	bash
+COPY nginx.conf ./
+COPY start.sh ./
+
+ENTRYPOINT ["/bin/bash", "./start.sh"]
