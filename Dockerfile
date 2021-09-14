@@ -18,11 +18,13 @@ ADD setup.py ./
 RUN pip3 install --no-cache-dir -e .
 
 RUN mkdir logs && chown -R indy:indy logs && chmod -R ug+rw logs
+USER root
+RUN apt-get -y update && apt-get -y install nginx
 
-RUN apk add --no-cache \
-	nginx \
-	bash
-COPY nginx.conf ./
+EXPOSE 5000
+
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY start.sh ./
 
 ENTRYPOINT ["/bin/bash", "./start.sh"]
+# ENTRYPOINT [ "bash" ]
