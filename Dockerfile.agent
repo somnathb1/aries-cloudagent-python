@@ -21,5 +21,5 @@ RUN mkdir logs && chown -R indy:indy logs && chmod -R ug+rw logs
 
 EXPOSE 11020
 
-ENTRYPOINT aca-py start --inbound-transport http 127.0.0.1 11020 --outbound-transport http
+ENTRYPOINT aca-py start --inbound-transport http 0.0.0.0 11020 --outbound-transport http
 # ENTRYPOINT [ "bash" ]
