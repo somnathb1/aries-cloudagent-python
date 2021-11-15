@@ -19,6 +19,8 @@ from runners.support.agent import (  # noqa:E402
     default_genesis_txns,
     start_mediator_agent,
     connect_wallet_to_mediator,
+    start_endorser_agent,
+    connect_wallet_to_endorser,
     CRED_FORMAT_INDY,
     CRED_FORMAT_JSON_LD,
     DID_METHOD_SOV,
@@ -54,6 +56,7 @@ class AriesAgent(DemoAgent):
         no_auto: bool = False,
         seed: str = None,
         aip: int = 20,
+        endorser_role: str = None,
         **kwargs,
     ):
         super().__init__(
@@ -63,6 +66,7 @@ class AriesAgent(DemoAgent):
             prefix=prefix,
             seed=seed,
             aip=aip,
+            endorser_role=endorser_role,
             extra_args=(
                 []
                 if no_auto
@@ -109,12 +113,32 @@ class AriesAgent(DemoAgent):
 
         if conn_id == self.connection_id:
             # inviter or invitee:
-            if (
-                message["rfc23_state"] in ["completed", "response-sent"]
-                and not self._connection_ready.done()
-            ):
-                self.log("Connected")
-                self._connection_ready.set_result(True)
+            if message["rfc23_state"] in ["completed", "response-sent"]:
+                if not self._connection_ready.done():
+                    self.log("Connected")
+                    self._connection_ready.set_result(True)
+
+                # setup endorser properties
+                self.log("Check for endorser role ...")
+                if self.endorser_role:
+                    if self.endorser_role == "author":
+                        connection_job_role = "TRANSACTION_AUTHOR"
+                        # short pause here to avoid race condition (both agents updating the connection role)
+                        await asyncio.sleep(2.0)
+                    elif self.endorser_role == "endorser":
+                        connection_job_role = "TRANSACTION_ENDORSER"
+                        # short pause here to avoid race condition (both agents updating the connection role)
+                        await asyncio.sleep(1.0)
+                    else:
+                        connection_job_role = "None"
+
+                    self.log(
+                        f"Updating endorser role for connection: {self.connection_id}, {connection_job_role}"
+                    )
+                    await self.admin_POST(
+                        "/transactions/" + self.connection_id + "/set-endorser-role",
+                        params={"transaction_my_job": connection_job_role},
+                    )
 
     async def handle_issue_credential(self, message):
         state = message["state"]
@@ -558,6 +582,7 @@ class AgentContainer:
         seed: str = "random",
         aip: int = 20,
         arg_file: str = None,
+        endorser_role: str = None,
     ):
         # configuration parameters
         self.genesis_txns = genesis_txns
@@ -571,11 +596,18 @@ class AgentContainer:
         self.multitenant = multitenant
         self.mediation = mediation
         self.use_did_exchange = use_did_exchange
+        print("Setting use_did_exchange:", self.use_did_exchange)
         self.wallet_type = wallet_type
         self.public_did = public_did
         self.seed = seed
         self.aip = aip
         self.arg_file = arg_file
+        self.endorser_role = endorser_role
+        if endorser_role:
+            # endorsers and authors need public DIDs (assume cred_type is Indy)
+            if endorser_role == "author" or endorser_role == "endorser":
+                self.public_did = True
+                self.cred_type = CRED_FORMAT_INDY
 
         self.exchange_tracing = False
 
@@ -588,6 +620,7 @@ class AgentContainer:
         the_agent: DemoAgent = None,
         schema_name: str = None,
         schema_attrs: list = None,
+        create_endorser_agent: bool = False,
     ):
         """Startup agent(s), register DID, schema, cred def as appropriate."""
 
@@ -611,6 +644,7 @@ class AgentContainer:
                 seed=self.seed,
                 aip=self.aip,
                 arg_file=self.arg_file,
+                endorser_role=self.endorser_role,
             )
         else:
             self.agent = the_agent
@@ -618,21 +652,33 @@ class AgentContainer:
         await self.agent.listen_webhooks(self.start_port + 2)
 
         if self.public_did and self.cred_type != CRED_FORMAT_JSON_LD:
-            await self.agent.register_did(cred_type=self.cred_type)
+            await self.agent.register_did(cred_type=CRED_FORMAT_INDY)
             log_msg("Created public DID")
+
+        # if we are endorsing, create the endorser agent first, then we can use the
+        # multi-use invitation to auto-connect the agent on startup
+        if create_endorser_agent:
+            self.endorser_agent = await start_endorser_agent(
+                self.start_port + 7,
+                self.genesis_txns,
+                use_did_exchange=self.use_did_exchange,
+            )
+            if not self.endorser_agent:
+                raise Exception("Endorser agent returns None :-(")
+
+            # set the endorser invite so the agent can auto-connect
+            self.agent.endorser_invite = (
+                self.endorser_agent.endorser_multi_invitation_url
+            )
+            self.agent.endorser_did = self.endorser_agent.endorser_public_did
+        else:
+            self.endorser_agent = None
 
         with log_timer("Startup duration:"):
             await self.agent.start_process()
 
         log_msg("Admin URL is at:", self.agent.admin_url)
         log_msg("Endpoint URL is at:", self.agent.endpoint)
-
-        if self.public_did and self.cred_type == CRED_FORMAT_JSON_LD:
-            # create did of appropriate type
-            data = {"method": DID_METHOD_KEY, "options": {"key_type": KEY_TYPE_BLS}}
-            new_did = await self.agent.admin_POST("/wallet/did/create", data=data)
-            self.agent.did = new_did["result"]["did"]
-            log_msg("Created DID key")
 
         if self.mediation:
             self.mediator_agent = await start_mediator_agent(
@@ -651,11 +697,19 @@ class AgentContainer:
                 public_did=self.public_did,
                 webhook_port=None,
                 mediator_agent=self.mediator_agent,
+                endorser_agent=self.endorser_agent,
             )
         elif self.mediation:
             # we need to pre-connect the agent to its mediator
             if not await connect_wallet_to_mediator(self.agent, self.mediator_agent):
                 raise Exception("Mediation setup FAILED :-(")
+
+        if self.public_did and self.cred_type == CRED_FORMAT_JSON_LD:
+            # create did of appropriate type
+            data = {"method": DID_METHOD_KEY, "options": {"key_type": KEY_TYPE_BLS}}
+            new_did = await self.agent.admin_POST("/wallet/did/create", data=data)
+            self.agent.did = new_did["result"]["did"]
+            log_msg("Created DID key")
 
         if schema_name and schema_attrs:
             # Create a schema/cred def
@@ -816,6 +870,9 @@ class AgentContainer:
 
         terminated = True
         try:
+            if self.endorser_agent:
+                log_msg("Shutting down endorser agent ...")
+                await self.endorser_agent.terminate()
             if self.mediator_agent:
                 log_msg("Shutting down mediator agent ...")
                 await self.mediator_agent.terminate()
@@ -959,15 +1016,16 @@ def arg_parser(ident: str = None, port: int = 8020):
             action="store_true",
             help="Use DID-Exchange protocol for connections",
         )
-        parser.add_argument(
-            "--revocation", action="store_true", help="Enable credential revocation"
-        )
-        parser.add_argument(
-            "--tails-server-base-url",
-            type=str,
-            metavar=("<tails-server-base-url>"),
-            help="Tails server base url",
-        )
+    parser.add_argument(
+        "--revocation", action="store_true", help="Enable credential revocation"
+    )
+    parser.add_argument(
+        "--tails-server-base-url",
+        type=str,
+        metavar=("<tails-server-base-url>"),
+        help="Tails server base url",
+    )
+    if (not ident) or (ident != "alice"):
         parser.add_argument(
             "--cred-type",
             type=str,
@@ -996,6 +1054,21 @@ def arg_parser(ident: str = None, port: int = 8020):
         type=str,
         metavar="<wallet-type>",
         help="Set the agent wallet type",
+    )
+    parser.add_argument(
+        "--endorser-role",
+        type=str.lower,
+        choices=["author", "endorser", "none"],
+        metavar="<endorser-role>",
+        help=(
+            "Specify the role ('author' or 'endorser') which this agent will "
+            "participate. Authors will request transaction endorement from an "
+            "Endorser. Endorsers will endorse transactions from Authors, and "
+            "may write their own  transactions to the ledger. If no role "
+            "(or 'none') is specified then the endorsement protocol will not "
+            " be used and this agent will write transactions to the ledger "
+            "directly."
+        ),
     )
     parser.add_argument(
         "--arg-file",
@@ -1087,12 +1160,13 @@ async def create_agent_with_args(args, ident: str = None):
         multitenant=args.multitenant,
         mediation=args.mediation,
         cred_type=cred_type,
-        use_did_exchange=args.did_exchange if ("did_exchange" in args) else (aip == 20),
+        use_did_exchange=(aip == 20) if ("aip" in args) else args.did_exchange,
         wallet_type=arg_file_dict.get("wallet-type") or args.wallet_type,
         public_did=public_did,
         seed="random" if public_did else None,
         arg_file=arg_file,
         aip=aip,
+        endorser_role=args.endorser_role,
     )
 
     return agent
